@@ -204,6 +204,10 @@ class Transformer(nn.Module):
         return self.resblocks(x)
 
 
+def sample(t: torch.Tensor, coords: torch.Tensor):
+    return F.grid_sample(t, coords.permute(0, 2, 1, 3), padding_mode='border', align_corners=True)
+
+
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
@@ -213,6 +217,8 @@ class VisionTransformer(nn.Module):
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.num_patches = (input_resolution // patch_size)
+        self.width = width
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
@@ -223,10 +229,25 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
+        B, _, H, W = x.shape
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+
+        reshaped_pe = self.positional_embedding.to(x.dtype)[1:] \
+            .reshape(1, self.num_patches, self.num_patches, self.width) \
+            .permute(0, 3, 1, 2)
+
+        XX, YY = torch.meshgrid(torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype),
+                                torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype))
+
+        coords = torch.cat([XX.unsqueeze(-1), YY.unsqueeze(-1)], dim=-1).unsqueeze(0)
+
+        sampled_pe = sample(reshaped_pe, coords).reshape(self.width, H * W).permute(1, 0)  # shape = [grid ** 2, width]
+        pe = torch.cat([self.positional_embedding.to(x.dtype)[0].unsqueeze(0), sampled_pe], dim=0).unsqueeze(0)
+
+        x = torch.cat([self.class_embedding.to(x.dtype).unsqueeze(0).unsqueeze(0), x],
+                      dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + pe
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -237,6 +258,42 @@ class VisionTransformer(nn.Module):
 
         if self.proj is not None:
             x = x @ self.proj
+
+        return x
+
+    def forward_spatial(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        B, _, H, W = x.shape
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        reshaped_pe = self.positional_embedding.to(x.dtype)[1:] \
+            .reshape(1, self.num_patches, self.num_patches, self.width) \
+            .permute(0, 3, 1, 2)
+
+        XX, YY = torch.meshgrid(torch.linspace(-1, 1, H, device=x.device, dtype=x.dtype),
+                                torch.linspace(-1, 1, W, device=x.device, dtype=x.dtype))
+
+        coords = torch.cat([XX.unsqueeze(-1), YY.unsqueeze(-1)], dim=-1).unsqueeze(0)
+
+        sampled_pe = sample(reshaped_pe, coords).reshape(self.width, H * W).permute(1, 0)  # shape = [grid ** 2, width]
+        pe = torch.cat([self.positional_embedding.to(x.dtype)[0].unsqueeze(0), sampled_pe], dim=0).unsqueeze(0)
+
+        x = torch.cat([self.class_embedding.to(x.dtype).unsqueeze(0).unsqueeze(0), x],
+                      dim=1)  # shape = [*, grid ** 2 + 1, width]
+        x = x + pe
+        x = self.ln_pre(x)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+
+        x = self.ln_post(x)
+
+        if self.proj is not None:
+            x = torch.einsum("bpc,ck->bpk", x, self.proj)
+
+        x = x[:, 1:, :].reshape(B, H, W, self.proj.shape[-1]).permute(0, 3, 1, 2)
 
         return x
 
@@ -338,6 +395,9 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
+    def get_visual_features(self, image):
+        return self.visual.forward_spatial(image.type(self.dtype))
+
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
@@ -402,12 +462,14 @@ def build_model(state_dict: dict):
 
     if vit:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_layers = len(
+            [k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
         grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
         image_resolution = vision_patch_size * grid_size
     else:
-        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
+        counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in
+                        [1, 2, 3, 4]]
         vision_layers = tuple(counts)
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
