@@ -261,7 +261,7 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def forward_spatial(self, x: torch.Tensor):
+    def forward_spatial(self, x: torch.Tensor, include_cls=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         B, _, H, W = x.shape
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -279,8 +279,9 @@ class VisionTransformer(nn.Module):
         sampled_pe = sample(reshaped_pe, coords).reshape(self.width, H * W).permute(1, 0)  # shape = [grid ** 2, width]
         pe = torch.cat([self.positional_embedding.to(x.dtype)[0].unsqueeze(0), sampled_pe], dim=0).unsqueeze(0)
 
-        x = torch.cat([self.class_embedding.to(x.dtype).unsqueeze(0).unsqueeze(0), x],
-                      dim=1)  # shape = [*, grid ** 2 + 1, width]
+        reshaped_ce = self.class_embedding.to(x.dtype).reshape(1, 1, -1).broadcast_to((B, 1, x.shape[-1]))
+        x = torch.cat([reshaped_ce, x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+
         x = x + pe
         x = self.ln_pre(x)
 
@@ -293,9 +294,12 @@ class VisionTransformer(nn.Module):
         if self.proj is not None:
             x = torch.einsum("bpc,ck->bpk", x, self.proj)
 
-        x = x[:, 1:, :].reshape(B, H, W, self.proj.shape[-1]).permute(0, 3, 1, 2)
-
-        return x
+        spatial = x[:, 1:, :].reshape(B, H, W, self.proj.shape[-1]).permute(0, 3, 1, 2)
+        if include_cls:
+            cls = x[:, 0, :]
+            return spatial.to(torch.float32), cls.to(torch.float32)
+        else:
+            return spatial.to(torch.float32)
 
 
 class CLIP(nn.Module):
@@ -395,8 +399,8 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def get_visual_features(self, image):
-        return self.visual.forward_spatial(image.type(self.dtype))
+    def get_visual_features(self, image, include_cls):
+        return self.visual.forward_spatial(image.type(self.dtype), include_cls)
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
