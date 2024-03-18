@@ -297,9 +297,9 @@ class VisionTransformer(nn.Module):
         spatial = x[:, 1:, :].reshape(B, H, W, self.proj.shape[-1]).permute(0, 3, 1, 2)
         if include_cls:
             cls = x[:, 0, :]
-            return spatial.to(torch.float32), cls.to(torch.float32)
+            return spatial, cls
         else:
-            return spatial.to(torch.float32)
+            return spatial
 
 
 class CLIP(nn.Module):
